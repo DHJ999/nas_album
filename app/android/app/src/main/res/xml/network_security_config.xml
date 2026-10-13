@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NAS 在局域网可能以明文 HTTP 提供服务（端口以 NAS 上实际配置的为准），
+  因此需要显式允许明文流量，否则 Android 9+ 会直接拒绝请求。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

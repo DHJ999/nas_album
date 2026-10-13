@@ -1,0 +1,49 @@
+# ============================================================
+# NAS相册 · Git 忽略规则
+# 原则：只传源码与文档；构建产物、本地分析资料、本机文件一律不传。
+# ============================================================
+
+# ---- Flutter / Dart 构建产物（约 1.1G，绝不可传）----
+app/build/
+app/.dart_tool/
+app/.packages
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/flutter_01.log
+
+# ---- Android 本机文件 ----
+app/android/.gradle/
+app/android/app/build/
+# 本机生成：含 SDK 路径与当前版本号，换机后由 flutter build 自动重建
+app/android/local.properties
+app/android/key.properties
+
+# ---- 签名密钥（若将来配置了发布签名，绝不入库）----
+*.jks
+*.keystore
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+
+# ---- 项目特定：本地分析资料（不入库）----
+_analysis/
+
+# ---- 本地文档：实现说明 / 构建手册等（保留在本地，不随仓库分发）----
+docs/
+# ---- 本地临时资料（含构建手册/应急脚本，2026-10-10 由 docs/ 改名，明确不提交）----
+temp不提交GitHub/
+
+# ---- 构建日志 ----
+_build_log.txt
+
+# ---- 其他 ----
+# APK 走 GitHub Release 附件发布，不直接入库（见本地构建与发布指南）
+*.apk
+.DS_Store
+Thumbs.db
+
+# ---- 构建期注入的接口参数（绝不入库）----
+app/tool/secrets.json
+app/lib/core/secrets.g.dart
