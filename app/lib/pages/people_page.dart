@@ -1,15 +1,20 @@
 import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
+import '../core/error_text.dart';
 import '../core/theme.dart';
 import '../models/models.dart';
-import '../widgets/fnos_image.dart';
+import '../widgets/square_thumb_tile.dart';
 import 'person_detail_page.dart';
 
 /// 人物：直接展示fnOS设备端人脸识别的聚类结果
 /// 头像接口实测：GET /p/api/v1/stream/person_poster/{personId} → JPEG
 class PeoplePage extends StatefulWidget {
-  const PeoplePage({super.key});
+  /// 嵌在别的页面里时用 true：不自带 Scaffold / 大标题，
+  /// 由外层提供外壳（避免嵌套 Scaffold 出现两条顶栏）。
+  final bool embedded;
+
+  const PeoplePage({super.key, this.embedded = false});
   @override
   State<PeoplePage> createState() => _PeoplePageState();
 }
@@ -19,7 +24,13 @@ class _PeoplePageState extends State<PeoplePage>
   List<PersonItem> _people = const [];
   bool _loading = true;
   String? _err;
-  bool _aiEnabled = false;
+
+  /// 人脸识别状态：三态。
+  ///   true  = 已开启；false = 确实没开启；null = 状态查询失败（未知）。
+  /// 以前是 bool，`catch (_) {}` 会把"查询失败"与"没开启"混为一谈，
+  /// 于是空态一律断言"设备端人脸识别尚未开启"，误导用户去 NAS 后台排查
+  /// 一个根本不存在的问题。
+  bool? _aiEnabled;
 
   /// 头像缓存版本号：从人物详情页返回后 +1，用来绕过 [FnosImage] 的
   /// 内存缓存（换过封面后 URL 不变，只能靠缓存键变化强制重拉）。
@@ -35,32 +46,41 @@ class _PeoplePageState extends State<PeoplePage>
   }
 
   Future<void> _load() async {
+    if (!mounted) return;
     setState(() {
-      _loading = true;
+      // 已有数据时不再整屏转圈：否则每次下拉刷新都会把 GridView 整个销毁，
+      // 滚动位置归零 + 白屏一瞬。只有首次加载（列表为空）才显示整屏 loading。
+      if (_people.isEmpty) _loading = true;
       _err = null;
     });
     try {
       final c = AppState.I.client;
       if (c == null) throw StateError('尚未连接到 NAS');
       final list = await c.people();
-      bool enabled = false;
+      bool? enabled;
       try {
         final st = await c.aiFaceStatus();
         enabled = st['enabled'] == true;
-      } catch (_) {}
-      if (mounted) {
-        setState(() {
-          _people = list;
-          _aiEnabled = enabled;
-          _loading = false;
-        });
+      } catch (_) {
+        enabled = null; // 查询失败，状态未知
       }
+      if (!mounted) return;
+      setState(() {
+        _people = list;
+        _aiEnabled = enabled;
+        _loading = false;
+      });
     } catch (e) {
-      if (mounted) {
-        setState(() {
-          _err = '$e';
-          _loading = false;
-        });
+      if (!mounted) return;
+      final msg = friendlyError(e);
+      setState(() {
+        _err = msg;
+        _loading = false;
+      });
+      // 已有数据时不把整页换成错误页（列表和滚动位置都还在），改用底部提示
+      if (_people.isNotEmpty) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('刷新失败：$msg')));
       }
     }
   }
@@ -79,6 +99,46 @@ class _PeoplePageState extends State<PeoplePage>
   @override
   Widget build(BuildContext context) {
     super.build(context);
+    final body = RefreshIndicator(
+      onRefresh: _load,
+      child: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _err != null && _people.isEmpty
+              ? ListView(
+                  // 内容不足一屏时 ListView 默认不接受拖动，
+                  // RefreshIndicator 就拉不动了 —— 恰在最需要重试的状态下失效。
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  children: [
+                    const SizedBox(height: 140),
+                    Center(child: Text('加载失败：$_err')),
+                  ],
+                )
+              : _people.isEmpty
+                  ? ListView(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      children: [
+                        const SizedBox(height: 120),
+                        Icon(Icons.face_retouching_natural,
+                            size: 56,
+                            color: Theme.of(context).colorScheme.outline),
+                        const SizedBox(height: 12),
+                        Center(
+                          child: Text(
+                            _aiEnabled == true
+                                ? '人脸识别已开启，但还没有聚类结果'
+                                : _aiEnabled == false
+                                    ? '设备端人脸识别尚未开启'
+                                    : '未能读取人脸识别状态，请下拉刷新重试',
+                            style: const TextStyle(
+                                color: FnosColors.textSub),
+                          ),
+                        ),
+                      ],
+                    )
+                  : _grid(),
+    );
+    // 嵌入模式：只给内容，外层负责 Scaffold / 标题
+    if (widget.embedded) return body;
     return Scaffold(
       appBar: FnosLargeTitle(
         text: '人物',
@@ -90,156 +150,35 @@ class _PeoplePageState extends State<PeoplePage>
           ),
         ],
       ),
-      body: RefreshIndicator(
-        onRefresh: _load,
-        child: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : _err != null
-                ? ListView(children: [
-                    const SizedBox(height: 140),
-                    Center(child: Text('加载失败：$_err')),
-                  ])
-                : _people.isEmpty
-                    ? ListView(children: [
-                        const SizedBox(height: 120),
-                        Icon(Icons.face_retouching_natural,
-                            size: 56,
-                            color: Theme.of(context).colorScheme.outline),
-                        const SizedBox(height: 12),
-                        Center(
-                          child: Text(
-                            _aiEnabled
-                                ? '人脸识别已开启，但还没有聚类结果'
-                                : '设备端人脸识别尚未开启',
-                            style: const TextStyle(
-                                color: FnosColors.textSub),
-                          ),
-                        ),
-                      ])
-                    : _grid(),
-      ),
+      body: body,
     );
   }
 
   /// 人物网格。
   ///
-  /// ⚠️ **不能再用 `childAspectRatio` 去凑单元格比例** ——
-  /// 之前 `Column > Expanded > ClipOval` 的写法让头像高度等于
-  /// 「单元格高 − 文字区高」，而单元格宽又和它不等，于是 ClipOval 裁出来的
-  /// 是**横向椭圆**。现在改成：先由可用宽度算出单元格宽度，再把
-  /// `mainAxisExtent` 定成「正方形边长 + 文字区高度」，头像区用固定
-  /// `边长 × 边长` 的 SizedBox —— 任何屏幕宽度、任何字体缩放下都是正圆。
+  /// 与地点 / 视频 / 图片**共用同一套栅格与卡片**（[SquareThumbTile] +
+  /// [CategoryGridDelegate]，3 列正方形），保证四个分类的卡片尺寸完全一致。
+  /// 姓名叠在头像底部的渐变蒙层上，不再占用额外高度。
   Widget _grid() {
-    const double pad = 20, gap = 18;
-    const int cols = 3;
-
-    return LayoutBuilder(
-      builder: (context, cst) {
-        final scale = MediaQuery.textScalerOf(context).scale(1.0);
-        // 文字区（8 间距 + 姓名行 + 2 + 计数行）随系统字体缩放同步放大，
-        // 留 6% 余量，避免大字体下正文被裁掉。
-        final labelH = (8 + 17 + 2 + 15) * (scale < 1 ? 1.0 : scale) * 1.06;
-        final cellW =
-            (cst.maxWidth - pad * 2 - gap * (cols - 1)) / cols;
-
-        return GridView.builder(
-          padding: const EdgeInsets.fromLTRB(pad, 12, pad, 16),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: cols,
-            mainAxisSpacing: gap,
-            crossAxisSpacing: gap,
-            // 高度 = 正方形头像 + 文字区（不再用比例猜）
-            mainAxisExtent: cellW + labelH,
-          ),
-          itemCount: _people.length,
-          itemBuilder: (context, i) => _PersonTile(
-            person: _people[i],
-            index: i,
-            coverVersion: _coverVer[_people[i].id] ?? 0,
-            onTap: () => _open(_people[i], i),
-          ),
+    return GridView.builder(
+      padding: kCategoryGridPadding,
+      gridDelegate: AdaptiveCategoryGrid(context),
+      itemCount: _people.length,
+      itemBuilder: (context, i) {
+        final p = _people[i];
+        final name = p.displayName == '未命名' ? '人物 ${i + 1}' : p.displayName;
+        return SquareThumbTile(
+          // 实测：用 id 而非 faceId
+          imagePath: '/p/api/v1/stream/person_poster/${p.id}',
+          // 换过封面才带版本参数；没换过就完全走原来的请求（更稳）
+          params: (_coverVer[p.id] ?? 0) == 0
+              ? null
+              : {'v': '${_coverVer[p.id]}'},
+          title: name,
+          placeholderIcon: Icons.person,
+          onTap: () => _open(p, i),
         );
       },
-    );
-  }
-}
-
-class _PersonTile extends StatelessWidget {
-  final PersonItem person;
-  final int index;
-  final int coverVersion;
-  final VoidCallback onTap;
-
-  const _PersonTile({
-    required this.person,
-    required this.index,
-    required this.coverVersion,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final name = person.displayName == '未命名'
-        ? '人物 ${index + 1}'
-        : person.displayName;
-
-    return GestureDetector(
-      onTap: onTap,
-      child: LayoutBuilder(
-        builder: (context, cst) {
-          final side = cst.maxWidth.isFinite ? cst.maxWidth : 96.0;
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // 严格正方形 —— 宽高都用同一个 side，ClipOval 必然是正圆
-              SizedBox(
-                width: side,
-                height: side,
-                child: ClipOval(
-                  child: FnosImage(
-                    // 实测：用 id 而非 faceId
-                    path: '/p/api/v1/stream/person_poster/${person.id}',
-                    // 换过封面才带版本参数；没换过就完全走原来的请求（更稳）
-                    params: coverVersion == 0 ? null : {'v': '$coverVersion'},
-                    fit: BoxFit.cover,
-                    placeholder: Container(
-                      color: FnosColors.field,
-                      child: const Icon(Icons.person,
-                          size: 34, color: FnosColors.textSub),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
-              // 文字区吃掉剩余高度并裁剪，字体再大也不会撑破网格、不报溢出
-              Expanded(
-                child: ClipRect(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(name,
-                          maxLines: 1,
-                          textAlign: TextAlign.center,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w600,
-                              color: FnosColors.textMain)),
-                      const SizedBox(height: 2),
-                      Text('${person.itemCount} 项',
-                          maxLines: 1,
-                          textAlign: TextAlign.center,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                              fontSize: 12, color: FnosColors.textSub)),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          );
-        },
-      ),
     );
   }
 }

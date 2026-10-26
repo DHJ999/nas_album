@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
+import '../core/error_text.dart';
 import '../core/theme.dart';
 import '../models/models.dart';
 import 'photo_grid_page.dart';
@@ -33,10 +34,19 @@ class PersonDetailPage extends StatefulWidget {
 class _PersonDetailPageState extends State<PersonDetailPage> {
   late final ValueNotifier<String> _title;
 
+  /// 当前人物名（进入本页时的值，改名成功后同步更新）。
+  ///
+  /// 以前预填与"是否修改过"的比较都直接用 `widget.person.name`（它永不变化），
+  /// 于是改名成功后：再点「重命名」输入框又是旧名字（用户以为没保存成功），
+  /// 而直接点保存又会因 `name == widget.person.name` 被静默 return ——
+  /// 对话框关掉、没有提示、没有错误，用户无法判断到底存没存上。
+  late String _currentName;
+
   @override
   void initState() {
     super.initState();
     _title = ValueNotifier(widget.displayName);
+    _currentName = widget.person.name;
   }
 
   @override
@@ -59,7 +69,7 @@ class _PersonDetailPageState extends State<PersonDetailPage> {
       _snack('尚未连接到 NAS');
       return;
     }
-    final ctrl = TextEditingController(text: widget.person.name);
+    final ctrl = TextEditingController(text: _currentName);
     final input = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -99,15 +109,19 @@ class _PersonDetailPageState extends State<PersonDetailPage> {
       _snack('姓名不能为空');
       return;
     }
-    if (name == widget.person.name) return;
+    if (name == _currentName) {
+      _snack('姓名没有变化');
+      return;
+    }
 
     try {
       await c.renamePerson(widget.person.id, name);
       if (!mounted) return;
+      _currentName = name;
       _title.value = name;
       _snack('已保存');
     } catch (e) {
-      _snack('保存失败：$e');
+      _snack('保存失败：${friendlyError(e)}');
     }
   }
 
@@ -174,7 +188,7 @@ class _PersonDetailPageState extends State<PersonDetailPage> {
       await c.setPersonCover(widget.person.id, p.id);
       _snack('已设为封面');
     } catch (e) {
-      _snack('设置封面失败：$e');
+      _snack('设置封面失败：${friendlyError(e)}');
     }
   }
 

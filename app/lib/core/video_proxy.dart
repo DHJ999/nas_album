@@ -16,6 +16,7 @@ library;
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 
 import 'app_state.dart';
 import 'fnos_crypto.dart';
@@ -24,8 +25,31 @@ class VideoProxy {
   VideoProxy._();
   static final VideoProxy I = VideoProxy._();
 
+  /// 代理地址里携带的准入令牌参数名。
+  static const _tokenParam = '__px';
+
   HttpServer? _server;
   int? _port;
+
+  /// 启动中的 Future（幂等 + 并发安全）。
+  ///
+  /// 以前只判断 `_server != null`，而 `HttpServer.bind` 是异步的：两个并发
+  /// 调用会双双通过检查、各自 bind 一次，后完成的覆盖 `_server`，
+  /// 前一个 server 便泄漏下来继续监听。缓存 Future 即可让并发调用共用一次 bind。
+  Future<int>? _starting;
+
+  /// 回环代理的准入令牌。
+  ///
+  /// 127.0.0.1 在 Android 上**不隔离**：同设备的任何应用都能连本机端口。
+  /// 而本代理会自动注入 Cookie 与 authx 签名——等于把「读该用户 NAS 相册」
+  /// 的能力开放给本机所有应用。加一个进程内随机令牌，URL 里不带就直接拒绝。
+  /// 播放链路不受影响：ExoPlayer 播放的正是我们自己生成的、带令牌的 URL。
+  final String _token = _genToken();
+
+  static String _genToken() {
+    final r = Random.secure();
+    return List.generate(16, (_) => r.nextInt(16).toRadixString(16)).join();
+  }
 
   /// 校验证书的客户端（公网可信证书场景）
   final HttpClient _secure = HttpClient()
@@ -41,16 +65,29 @@ class VideoProxy {
   /// 启动代理（幂等），返回监听端口。
   Future<int> ensureStarted() async {
     if (_server != null) return _port!;
+    // 并发调用共用同一次 bind；失败则清空槽位，允许下次重试。
+    final f = _starting ??= _bind();
+    try {
+      return await f;
+    } catch (_) {
+      _starting = null;
+      rethrow;
+    }
+  }
+
+  Future<int> _bind() async {
     // 端口传 0 由系统分配，避免冲突
-    _server = await HttpServer.bind('127.0.0.1', 0);
-    _port = _server!.port;
-    _server!.listen(_handle);
-    return _port!;
+    final s = await HttpServer.bind('127.0.0.1', 0);
+    _server = s;
+    _port = s.port;
+    s.listen(_handle);
+    return s.port;
   }
 
   /// 把 NAS 地址改写成代理地址。
   ///
-  /// 非 TLS 直接返回原地址（不走代理）；TLS 返回 `http://127.0.0.1:<port><path>`。
+  /// 非 TLS 直接返回原地址（不走代理）；TLS 返回
+  /// `http://127.0.0.1:<port><path>?<原 query>&__px=<token>`。
   Future<String> rewriteUrl(String path, {Map<String, dynamic>? params}) async {
     final c = AppState.I.client;
     final base = c?.baseUrl ?? '';
@@ -59,9 +96,7 @@ class VideoProxy {
     );
     if (c == null || !c.useTls) return original.toString();
     final port = await ensureStarted();
-    return Uri.parse('http://127.0.0.1:$port$path')
-        .replace(query: original.query)
-        .toString();
+    return _proxyUrl(port, path, original);
   }
 
   /// 供「下载完整文件」使用：无论 http/https 都改写到本地代理。
@@ -78,12 +113,28 @@ class VideoProxy {
       queryParameters: params?.map((k, v) => MapEntry(k, '$v')),
     );
     final port = await ensureStarted();
-    return Uri.parse('http://127.0.0.1:$port$path')
-        .replace(query: original.query)
-        .toString();
+    return _proxyUrl(port, path, original);
+  }
+
+  /// 拼代理地址：保留原 query（含 [path] 里自带的），并追加准入令牌。
+  String _proxyUrl(int port, String path, Uri original) {
+    final u = Uri.parse('http://127.0.0.1:$port$path');
+    final merged = <String, String>{};
+    merged.addAll(u.queryParameters);
+    merged.addAll(original.queryParameters);
+    merged[_tokenParam] = _token;
+    return u.replace(queryParameters: merged).toString();
   }
 
   Future<void> _handle(HttpRequest req) async {
+    // 先验令牌。127.0.0.1 在 Android 上不隔离，这道门是必需的。
+    final query = Map<String, String>.from(req.uri.queryParameters);
+    if (query.remove(_tokenParam) != _token) {
+      req.response.statusCode = HttpStatus.forbidden;
+      await req.response.close();
+      return;
+    }
+
     final c = AppState.I.client;
     if (c == null) {
       req.response.statusCode = HttpStatus.serviceUnavailable;
@@ -92,13 +143,20 @@ class VideoProxy {
     }
     try {
       final path = req.uri.path;
-      final target = Uri.parse('${c.baseUrl}$path').replace(query: req.uri.query);
+      // 令牌参数只属于「客户端 ↔ 代理」，绝不转发给 NAS。
+      final qs = query.entries
+          .map((e) => '${Uri.encodeQueryComponent(e.key)}='
+              '${Uri.encodeQueryComponent(e.value)}')
+          .join('&');
+      final target = Uri.parse('${c.baseUrl}$path${qs.isEmpty ? '' : '?$qs'}');
       final client = c.allowBadCertificate ? _insecure : _secure;
 
       final upReq = await client.openUrl(req.method, target);
       // 转发 ExoPlayer 的请求头（Range / Accept 等），跳过 host（由 target 决定）
       req.headers.forEach((key, values) {
-        if (key.toLowerCase() == 'host') return;
+        final lk = key.toLowerCase();
+        // accept-encoding 由下面统一声明 identity，不转发客户端取值
+        if (lk == 'host' || lk == 'accept-encoding') return;
         for (final v in values) {
           upReq.headers.add(key, v);
         }
@@ -106,14 +164,16 @@ class VideoProxy {
       // 注入鉴权（代理请求本身不带，ExoPlayer 带的会被下面的 set 覆盖）
       upReq.headers.set('x-access-source', 'app');
       upReq.headers.set('User-Agent', 'okhttp/4.12.0');
+      // 明确要 identity：Dart 的 HttpClient 默认 autoUncompress=true，
+      // 上游返回 gzip 时它会解压实体却保留压缩后的 content-length，
+      // 回灌给 ExoPlayer 的响应头就与实体对不上了。
+      upReq.headers.set('accept-encoding', 'identity');
       upReq.headers.set(
         'authx',
         buildAuthx(
           method: req.method,
           path: path,
-          params: req.uri.queryParameters.isEmpty
-              ? null
-              : Map<String, dynamic>.from(req.uri.queryParameters),
+          params: query.isEmpty ? null : Map<String, dynamic>.from(query),
           apiKey: c.apiKey,
         ),
       );

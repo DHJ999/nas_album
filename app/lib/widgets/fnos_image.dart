@@ -7,11 +7,21 @@ library;
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show mapEquals;
 import 'package:flutter/material.dart';
 
 import '../core/app_state.dart';
 import '../core/fnos_client.dart';
 import '../core/fnos_crypto.dart';
+// 缓存本体在 core/media_cache.dart：预加载调度器（core 层）要用它，
+// 放在 widgets 层会造成 core → widgets → core 的循环依赖。
+// 这里整文件导入并再导出 clearImageCache —— 全工程页面都是通过
+// `widgets/fnos_image.dart` 拿这个函数（历史接口，不改调用方）。
+import '../core/media_cache.dart';
+import '../core/media_preloader.dart' show MediaPreloader;
+
+/// 再导出：保持既有调用面（各页面 import fnos_image 就能用）。
+export '../core/media_cache.dart' show clearImageCache;
 
 /// 全局复用的 HttpClient（连接池 + 避免频繁建连）
 ///
@@ -36,43 +46,25 @@ HttpClient _httpFor(FnosClient c) {
     ..badCertificateCallback = (cert, host, port) => true;
 }
 
-/// 内存 LRU 缓存，避免瀑布流滚动时重复请求。
-/// 真 LRU：命中即移到队尾；同时受条数与字节总量双重上限约束。
-final Map<String, Uint8List> _memCache = {};
-int _memCacheBytes = 0;
-const int _memCacheMax = 260;
-const int _memCacheMaxBytes = 128 * 1024 * 1024; // 128MB 字节上限
+/// 内存缓存本体与增删查已移到 core/media_cache.dart（供预加载调度器共用）。
+
+/// 把图片下载实现注入预加载器：两者共用同一份缓存与同一套 in-flight 去重，
+/// 避免出现「预加载下好的图，翻过去仍然转圈」的两份缓存问题。
+///
+/// **只在启动时注入一次**。以前写在 [loadFnosImage] 开头，等于每加载一张图
+/// 就新建一个闭包重新注入一次 —— 那是所有图片加载的必经热路径。
+void attachPreloaderImageFetcher() {
+  MediaPreloader.I.attach((p) => loadFnosImage(p));
+}
 
 /// 进行中请求合并（in-flight dedup）：同一 key 的并发下载只发一次请求
 final Map<String, Future<Uint8List>> _inFlight = {};
 
-void _cacheHit(String key, Uint8List bytes) {
-  // 移到队尾，标记为最近使用
-  _memCache.remove(key);
-  _memCache[key] = bytes;
-}
-
-void _cachePut(String key, Uint8List bytes) {
-  final old = _memCache.remove(key);
-  if (old != null) _memCacheBytes -= old.length;
-  _memCache[key] = bytes;
-  _memCacheBytes += bytes.length;
-  // 从最久未使用（队首）开始淘汰，直到两个上限都满足
-  while (_memCache.isNotEmpty &&
-      (_memCache.length > _memCacheMax || _memCacheBytes > _memCacheMaxBytes)) {
-    final k = _memCache.keys.first;
-    _memCacheBytes -= _memCache[k]!.length;
-    _memCache.remove(k);
-  }
-}
-
 Future<Uint8List> loadFnosImage(String path, {Map<String, dynamic>? params}) async {
-  final key = params == null || params.isEmpty
-      ? path
-      : '$path?${(params.entries.map((e) => '${e.key}=${e.value}').toList()..sort()).join('&')}';
-  final hit = _memCache[key];
+  final key = imageCacheKey(path, params: params);
+  final hit = imageCacheGet(key);
   if (hit != null) {
-    _cacheHit(key, hit);
+    imageCacheHit(key, hit);
     return hit;
   }
   // 已有相同请求在下载则直接复用，避免切 tab / 快速滑动时重复请求
@@ -105,15 +97,18 @@ Future<Uint8List> _fetchFnosImage(String key, String path,
     if (bytes == null) throw HttpException('鉴权失效（401）');
   }
 
-  _cachePut(key, bytes);
+  imageCachePut(key, bytes);
   return bytes;
 }
 
 /// 返回 null 表示 401（可重登重试）；抛异常表示其它错误。
 Future<Uint8List?> _fetchOnce(FnosClient c, String path,
     {Map<String, dynamic>? params}) async {
-  final uri = Uri.parse('${c.baseUrl}$path').replace(
-    queryParameters: params?.map((k, v) => MapEntry(k, '$v')),
+  // 设备下发的部分 URL 自带 query。签名基准必须与**实际发出的 query**一致，
+  // 否则 authx 的 a 分量对不上 → 401（与 FnosClient._request 同一口径）。
+  final split = splitPathQuery(path, params);
+  final uri = Uri.parse('${c.baseUrl}${split.path}').replace(
+    queryParameters: split.params?.map((k, v) => MapEntry(k, '$v')),
   );
   // 关键：按会话证书策略选客户端，https 自签证书下必须用放行实例，
   // 否则 HandshakeException 会让所有图片请求失败。
@@ -122,7 +117,8 @@ Future<Uint8List?> _fetchOnce(FnosClient c, String path,
   req.headers.set('Accept', '*/*');
   req.headers.set('User-Agent', 'okhttp/4.12.0');
   req.headers.set('authx',
-      buildAuthx(method: 'GET', path: path, params: params, apiKey: c.apiKey));
+      buildAuthx(method: 'GET', path: split.path, params: split.params,
+          apiKey: c.apiKey));
   // 关键：用 client 的完整 Cookie jar（含门禁 os-access-code）。
   // 只拼 fnos-token 时，开启「访问码门禁」的 NAS 会拒绝所有图片请求。
   final cookie = c.cookieHeader;
@@ -149,11 +145,6 @@ Future<Uint8List?> _fetchOnce(FnosClient c, String path,
     builder.add(chunk);
   }
   return builder.takeBytes();
-}
-
-void clearImageCache() {
-  _memCache.clear();
-  _memCacheBytes = 0;
 }
 
 // ─────────────────────── 图片固有尺寸 & 解码目标 ───────────────────────
@@ -306,7 +297,10 @@ class _FnosImageState extends State<FnosImage> {
   @override
   void didUpdateWidget(covariant FnosImage old) {
     super.didUpdateWidget(old);
-    if (old.path != widget.path) {
+    // 必须连 params 一起比：人物页正是靠 `?v=<封面版本号>` 来击穿缓存的
+    // （path 不变、params 变）。只比 path 的话换完封面这里什么都不做，
+    // 内存缓存里的旧图会一直显示到进程重启。
+    if (old.path != widget.path || !mapEquals(old.params, widget.params)) {
       _bytes = null;
       _err = null;
       _load();
@@ -314,11 +308,22 @@ class _FnosImageState extends State<FnosImage> {
   }
 
   Future<void> _load() async {
+    // 记下本次请求对应的 (path, params)：请求在飞期间控件可能已被复用成
+    // 另一个条目，那时的结果必须丢弃，否则会把旧图盖到新条目上。
+    final path = widget.path;
+    final params = widget.params;
+    bool stale() =>
+        !mounted || widget.path != path || !mapEquals(widget.params, params);
     try {
-      final b = await loadFnosImage(widget.path, params: widget.params);
-      if (mounted) setState(() => _bytes = b);
+      final b = await loadFnosImage(path, params: params);
+      if (stale()) return;
+      setState(() {
+        _bytes = b;
+        _err = null;
+      });
     } catch (e) {
-      if (mounted) setState(() => _err = e);
+      if (stale()) return;
+      setState(() => _err = e);
     }
   }
 

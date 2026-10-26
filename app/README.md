@@ -43,9 +43,14 @@ flutter build apk --release
 ## 自检
 
 ```bash
-flutter test      # 单元测试（签名 / 日期 / 模型 / 地址归一化 / 图片解码，共 26 项）
-flutter analyze   # 应无 error 级问题（受限环境下会因 Dart 子进程问题崩溃，属环境限制）
+flutter test      # 单元测试，共 45 项：签名 / 日期 / 模型 / 地址归一化 / 图片解码 /
+                  # 带 query 的签名口径 / HTTPS 开关联动 / IPv6 拆解 / 错误文案
+flutter analyze   # 应无任何 error / warning / info
 ```
+
+> 若 `flutter analyze` 报 `CreateFile failed 5 ... Command: dartaotruntime.exe`，是当前
+> shell 的沙箱禁止它以「管道 stdio」启动 analysis_server 子进程（环境限制，不是代码
+> 问题）。改用 SDK 内置的 `dart analyze .` 即可，结果等价。
 
 ## 目录
 

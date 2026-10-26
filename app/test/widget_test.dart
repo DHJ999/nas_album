@@ -2,11 +2,14 @@
 //
 // 网络相关逻辑不在此测试（需要真实 NAS）。
 
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/painting.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:nas_album/core/app_state.dart';
+import 'package:nas_album/core/error_text.dart';
+import 'package:nas_album/core/fnos_client.dart';
 import 'package:nas_album/core/fnos_crypto.dart';
 import 'package:nas_album/models/models.dart';
 import 'package:nas_album/widgets/fnos_image.dart';
@@ -259,6 +262,152 @@ void main() {
       final t = resolveDecodeTarget(BoxFit.contain, 1080, 1920, null, 3);
       expect(t.w, 3240);
       expect(t.h, isNull);
+    });
+  });
+
+  // ── 以下为针对已修缺陷的回归测试 ──
+
+  group('地址自带 query 时的签名口径', () {
+    test('path 里的 query 经归一化后与显式 params 得到同一个 authx', () {
+      // 回归：以前 `_request` / `_fetchOnce` 把 "/x?w=100" 整个当 path 去算 md5，
+      // 而实际发出的 query 是 w=100，两者口径不一致 → 服务端 401。
+      // 现在两边都先过 splitPathQuery，结果必须逐字节相同。
+      final split = splitPathQuery('/p/api/v1/stream/p/t/8264/s/uuid?w=100', null);
+      final viaPath = buildAuthx(
+        method: 'GET',
+        path: split.path,
+        params: split.params,
+        nonce: '123456',
+        timestamp: '1791536000000',
+      );
+      final viaParams = buildAuthx(
+        method: 'GET',
+        path: '/p/api/v1/stream/p/t/8264/s/uuid',
+        params: {'w': '100'},
+        nonce: '123456',
+        timestamp: '1791536000000',
+      );
+      expect(viaPath, viaParams);
+    });
+
+    test('未归一化时两者确实不同 —— 说明这层归一化是必要的', () {
+      final raw = buildAuthx(
+        method: 'GET',
+        path: '/p/api/v1/stream/p/t/8264/s/uuid?w=100',
+        nonce: '123456',
+        timestamp: '1791536000000',
+      );
+      final normalized = buildAuthx(
+        method: 'GET',
+        path: '/p/api/v1/stream/p/t/8264/s/uuid',
+        params: {'w': '100'},
+        nonce: '123456',
+        timestamp: '1791536000000',
+      );
+      expect(raw, isNot(normalized));
+    });
+
+    test('拆出 path 与 query 参数', () {
+      final r = splitPathQuery('/x/y?w=100&h=50', null);
+      expect(r.path, '/x/y');
+      expect(r.params, {'w': '100', 'h': '50'});
+    });
+
+    test('显式 params 优先于地址里的 query', () {
+      final r = splitPathQuery('/x/y?w=1', {'w': '2', 'z': '3'});
+      expect(r.path, '/x/y');
+      expect(r.params, {'w': '2', 'z': '3'});
+    });
+
+    test('没有 query 时原样返回，params 保持 null', () {
+      final r = splitPathQuery('/p/api/v1/user/info', null);
+      expect(r.path, '/p/api/v1/user/info');
+      expect(r.params, isNull);
+    });
+
+    test('query 无法解码时保守回退，不丢参数', () {
+      // %zz 不是合法百分号转义，解码会抛；此时宁可保持原样交给调用方
+      final r = splitPathQuery('/x/y?a=%zz', null);
+      expect(r.path, '/x/y?a=%zz');
+      expect(r.params, isNull);
+    });
+  });
+
+  group('地址 scheme 识别（HTTPS 开关联动）', () {
+    test('https:// 提示用 TLS', () {
+      expect(AppState.tlsHintFromAddress('https://nas.local'), isTrue);
+      expect(AppState.tlsHintFromAddress('  HTTPS://nas.local  '), isTrue);
+    });
+
+    test('http:// 提示走明文', () {
+      expect(AppState.tlsHintFromAddress('http://192.168.1.2'), isFalse);
+    });
+
+    test('没写 scheme 时返回 null，沿用界面开关', () {
+      expect(AppState.tlsHintFromAddress('192.168.1.2'), isNull);
+      expect(AppState.tlsHintFromAddress('nas.local:8080'), isNull);
+    });
+  });
+
+  group('IPv6 地址不被误拆', () {
+    test('裸 IPv6 不再把末尾段当成端口', () {
+      // 回归：贪婪正则 ^(.+):(\d+)$ 会把 fe80::1 拆成 host="fe80:"、port="1"，
+      // 静默改写用户输入。现在端口只认输入框里的值。
+      final r = AppState.resolveAddress(
+          address: 'fe80::1', port: '8080', tls: false)!;
+      expect(r.host, 'fe80::1:8080');
+    });
+
+    test('带方括号的 IPv6 仍照常拆出端口', () {
+      final r = AppState.resolveAddress(
+          address: '[fe80::1]:9000', port: '', tls: false)!;
+      expect(r.host, '[fe80::1]:9000');
+    });
+
+    test('普通 host:port 行为不变', () {
+      final r = AppState.resolveAddress(
+          address: '192.168.10.2:8081', port: '8080', tls: false)!;
+      expect(r.host, '192.168.10.2:8081');
+    });
+  });
+
+  group('容错布尔解析', () {
+    test('接受大小写变体与 yes/on', () {
+      expect(PhotoItem.fromJson({'isRaw': 'TRUE'}).isRaw, isTrue);
+      expect(PhotoItem.fromJson({'isRaw': 'yes'}).isRaw, isTrue);
+      expect(PhotoItem.fromJson({'isRaw': ' On '}).isRaw, isTrue);
+      expect(PhotoItem.fromJson({'isRaw': 1}).isRaw, isTrue);
+    });
+
+    test('否定值与缺失值仍为 false', () {
+      expect(PhotoItem.fromJson({'isRaw': 'no'}).isRaw, isFalse);
+      expect(PhotoItem.fromJson({'isRaw': '0'}).isRaw, isFalse);
+      expect(PhotoItem.fromJson({}).isRaw, isFalse);
+    });
+  });
+
+  group('页面错误文案', () {
+    test('FnosException 直接用它自带的中文说明', () {
+      expect(friendlyError(const FnosException(-1, '无法连接 1.2.3.4:8080')), '无法连接 1.2.3.4:8080');
+    });
+
+    test('message 为空时退化为带 code 的描述', () {
+      expect(friendlyError(const FnosException(4224, '  ')),
+          'NAS 返回错误（code=4224）');
+    });
+
+    test('SocketException 翻译成人话，不再把英文原文摊给用户', () {
+      final msg = friendlyError(const SocketException('Connection refused'));
+      expect(msg, contains('连接不上 NAS'));
+      expect(msg, isNot(contains('SocketException')));
+    });
+
+    test('StateError 直接使用它的 message', () {
+      expect(friendlyError(StateError('尚未连接到 NAS')), '尚未连接到 NAS');
+    });
+
+    test('无法识别的异常保留原始文本，不吞掉信息', () {
+      expect(friendlyError(ArgumentError('bad argument')), contains('bad argument'));
     });
   });
 }

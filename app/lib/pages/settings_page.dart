@@ -2,10 +2,11 @@ import 'package:flutter/material.dart';
 
 import '../core/app_info.dart';
 import '../core/app_state.dart';
+import '../core/error_text.dart';
 import '../core/prefs.dart';
+import '../core/media_preloader.dart';
 import '../core/theme.dart';
 import '../models/models.dart';
-import '../widgets/fnos_image.dart';
 import 'agreement_page.dart';
 
 /// 「更多」页风格的分组圆角白卡
@@ -70,6 +71,10 @@ class _SettingsPageState extends State<SettingsPage>
   List<PhotoFolder> _folders = const [];
   bool _loading = true;
 
+  /// 用户信息 / 相册目录拉取失败的原因。以前这里是空 catch：失败时统计卡会
+  /// 以「照片总数 0 / 视频总数 0」冒充真实数据，管理员还会被显示成「普通用户」。
+  String? _err;
+
   bool _autoVideo = false;
   bool _autoAnim = true;
   String _downloadPath = AppPrefs.defaultDownloadRelativePath;
@@ -83,6 +88,11 @@ class _SettingsPageState extends State<SettingsPage>
     WidgetsBinding.instance.addPostFrameCallback((_) => _load());
   }
 
+  void _snack(String s) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(s)));
+  }
+
   Future<void> _load() async {
     final c = AppState.I.client;
     final av = await AppPrefs.autoPlayVideo();
@@ -93,6 +103,8 @@ class _SettingsPageState extends State<SettingsPage>
       _autoVideo = av;
       _autoAnim = aa;
       _downloadPath = dp;
+      _err = null;
+      _loading = true;
     });
     if (c == null) {
       setState(() => _loading = false);
@@ -101,16 +113,57 @@ class _SettingsPageState extends State<SettingsPage>
     try {
       final u = await c.userInfo();
       final f = await c.folders();
-      if (mounted) {
-        setState(() {
-          _user = u;
-          _folders = f;
-          _loading = false;
-        });
-      }
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
+      if (!mounted) return;
+      setState(() {
+        _user = u;
+        _folders = f;
+        _loading = false;
+        _err = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _err = friendlyError(e);
+      });
     }
+  }
+
+  /// 清除本机全部偏好（协议同意状态刻意保留）。
+  ///
+  /// 这是 [AppPrefs.clearAll] 的正式调用点 —— 之前它写好了却没人用。
+  Future<void> _resetPrefs() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('恢复默认设置'),
+        content: const Text('将清除本机保存的显示样式、播放偏好、下载目录、'
+            '登录表单记忆与地址历史，且不可恢复。\n\n'
+            '当前登录状态与「用户协议」同意记录不受影响。'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消')),
+          FilledButton(
+              style: FilledButton.styleFrom(minimumSize: const Size(72, 40)),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('恢复')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await AppPrefs.clearAll();
+    final av = await AppPrefs.autoPlayVideo();
+    final aa = await AppPrefs.autoPlayAnim();
+    final dp = await AppPrefs.downloadRelativePath();
+    if (!mounted) return;
+    setState(() {
+      _autoVideo = av;
+      _autoAnim = aa;
+      _downloadPath = dp;
+    });
+    _snack('已恢复默认设置');
   }
 
   /// 统一样式的开关行（与fnOS App 的分组卡一致）
@@ -216,6 +269,9 @@ class _SettingsPageState extends State<SettingsPage>
         ),
       ),
     );
+    // 对话框已关闭，释放它创建的那个 controller
+    //（本 State 没有 dispose，不在这里放就是每次打开泄漏一个）
+    controller.dispose();
   }
 
   @override
@@ -253,7 +309,11 @@ class _SettingsPageState extends State<SettingsPage>
                   style: const TextStyle(
                       fontWeight: FontWeight.w600,
                       color: FnosColors.textMain)),
-              subtitle: Text(_user?['isAdmin'] == true ? '管理员' : '普通用户',
+              // 身份未知时显示 '-'，不再一律断言成「普通用户」
+              subtitle: Text(
+                  _user == null
+                      ? '-'
+                      : (_user!['isAdmin'] == true ? '管理员' : '普通用户'),
                   style: const TextStyle(
                       fontSize: 12.5, color: FnosColors.textSub)),
             ),
@@ -263,6 +323,26 @@ class _SettingsPageState extends State<SettingsPage>
             const Padding(
               padding: EdgeInsets.all(24),
               child: Center(child: CircularProgressIndicator()),
+            )
+          else if (_err != null)
+            // 本页是 IndexedStack 常驻子页 + keepAlive，不重试就会一直停在
+            // 错误状态，所以失败态必须给出显式入口。
+            Padding(
+              padding: const EdgeInsets.only(top: 16),
+              child: _CardGroup(children: [
+                ListTile(
+                  contentPadding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  leading: const Icon(Icons.cloud_off_outlined, size: 22),
+                  title: const Text('统计信息获取失败',
+                      style: TextStyle(fontSize: 15)),
+                  subtitle: Text(_err!,
+                      style: const TextStyle(
+                          fontSize: 12.5, color: FnosColors.textSub)),
+                  trailing:
+                      TextButton(onPressed: _load, child: const Text('重试')),
+                ),
+              ]),
             )
           else ...[
             const _GroupTitle('统计'),
@@ -366,7 +446,7 @@ class _SettingsPageState extends State<SettingsPage>
                   ),
                 );
                 if (ok == true) {
-                  clearImageCache();
+                  MediaPreloader.I.resetAll();
                   await AppState.I.logout();
                 }
               },
@@ -392,6 +472,13 @@ class _SettingsPageState extends State<SettingsPage>
                   style: const TextStyle(
                       fontWeight: FontWeight.w600,
                       color: FnosColors.textSub)),
+            ),
+            ListTile(
+              leading: const Icon(Icons.restart_alt, size: 22),
+              title: const Text('恢复默认设置', style: TextStyle(fontSize: 15)),
+              subtitle: const Text('清除显示样式、播放偏好、下载目录等本机设置',
+                  style: TextStyle(fontSize: 12.5, color: FnosColors.textSub)),
+              onTap: _resetPrefs,
             ),
           ]),
 

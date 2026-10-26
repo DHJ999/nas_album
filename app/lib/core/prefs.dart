@@ -177,10 +177,16 @@ class AppPrefs {
   static Future<void> setDownloadRelativePath(String v) async =>
       (await _get()).setString(_kDownloadPath, v);
 
-  static Future<void> clearAll() async {
+  /// 清除全部本地设置。
+  ///
+  /// [keepTerms] 默认 true：协议同意状态与「设置项」性质不同，清掉它会让
+  /// RootGate 内存里的 `_agreed` 与磁盘状态不一致（要重启才会重新弹协议页），
+  /// 所以默认保留。确实要恢复成「首次启动」状态时才传 false。
+  static Future<void> clearAll({bool keepTerms = true}) async {
     final sp = await _get();
     for (final k in [
-      _kTerms, _kRemember, _kHost, _kPort, _kTls, _kUser, _kPwd,
+      if (!keepTerms) _kTerms,
+      _kRemember, _kHost, _kPort, _kTls, _kUser, _kPwd,
       _kSyncDelete, _kAccessCode, _kAddrHistory,
       _kAutoPlayVideo, _kAutoPlayAnim, _kViewMode, _kTrustCert,
       _kDownloadPath,

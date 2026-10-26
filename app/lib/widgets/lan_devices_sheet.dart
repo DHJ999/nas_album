@@ -182,7 +182,7 @@ class _LanDevicesSheetState extends State<_LanDevicesSheet> {
     }
     return ListView.separated(
       itemCount: _devices.length,
-      separatorBuilder: (_, __) => const Divider(height: 0.6),
+      separatorBuilder: (_, _) => const Divider(height: 0.6),
       itemBuilder: (context, i) {
         final d = _devices[i];
         return ListTile(

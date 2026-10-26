@@ -7,7 +7,6 @@ import '../core/prefs.dart';
 import '../core/theme.dart';
 import '../widgets/lan_devices_sheet.dart';
 import 'about_page.dart';
-import 'downloads_page.dart';
 
 /// 登录页 —— 登录页。
 ///
@@ -48,6 +47,13 @@ class _LoginPageState extends State<LoginPage> {
   bool _prefilled = false;
   bool _showFnIdHint = false;
 
+  /// 本次提交是否已在飞行中。
+  ///
+  /// 按钮的禁用条件用 [AppState.connecting]，而它是在 `connect()` 内部才置位的，
+  /// 而 `_submit` 前面还要 `await AppPrefs.accessCode()` —— 这个间隙里按钮仍可点，
+  /// 会并发触发两遍完整的门禁 + WebSocket 登录。
+  bool _submitting = false;
+
   @override
   void initState() {
     super.initState();
@@ -68,15 +74,34 @@ class _LoginPageState extends State<LoginPage> {
   void _onAddrChanged() {
     // 只在「裸 FN ID」出现/消失时重建提示文案
     final v = _isBareFnId;
-    if (v != _showFnIdHint) setState(() => _showFnIdHint = v);
+    // 地址里显式写了 https:// 就联动打开 HTTPS 开关，避免出现
+    // "预览按 https 显示、实际按明文去连 TLS 端口"这种自相矛盾的状态。
+    final hint = AppState.tlsHintFromAddress(_addr.text);
+    final syncTls = hint != null && hint != _useTls;
+    if (v != _showFnIdHint || syncTls) {
+      setState(() {
+        _showFnIdHint = v;
+        if (syncTls) _useTls = hint;
+      });
+    }
   }
+
+  /// 拆 `host:port` 用的正则。
+  ///
+  /// `[^:]+` 而不是 `.+`：裸 IPv6（fe80::1）会被贪婪匹配拆成 host="fe80:"、
+  /// port="1"，等于静默改写用户输入。带方括号的 IPv6（[fe80::1]:8080）
+  /// 仍照常拆出端口。与 [AppState.resolveAddress] 保持同一口径。
+  static final RegExp _hostPortRe = RegExp(r'^(\[[^\]]+\]|[^:]+):(\d+)$');
+
+  /// 全角冒号会随中文输入法一起进来，统一成半角再解析 / 保存。
+  static String _normalizeAddr(String s) => s.replaceAll('：', ':').trim();
 
   Future<void> _loadForm() async {
     final f = await AppPrefs.loadLoginForm();
-    var host = f.host;
+    var host = _normalizeAddr(f.host);
     var port = f.port;
     // 老版本可能把端口写在地址里（`host:port` 形式）—— 拆开回填到两个框
-    final m = RegExp(r'^(.+):(\d+)$').firstMatch(host.trim());
+    final m = _hostPortRe.firstMatch(host);
     if (m != null) {
       host = m.group(1)!;
       port = m.group(2)!;
@@ -87,7 +112,8 @@ class _LoginPageState extends State<LoginPage> {
       _port.text = port;
       _user.text = f.user;
       _pwd.text = f.password;
-      _useTls = f.useTls;
+      // 上次存的地址里若带 scheme，以它为准，避免开关与地址不一致
+      _useTls = AppState.tlsHintFromAddress(host) ?? f.useTls;
       _remember = f.rememberPassword;
       _trustCert = f.trustCert;
       _prefilled = true;
@@ -107,9 +133,9 @@ class _LoginPageState extends State<LoginPage> {
 
   /// 把 `host:port` 拆回两个输入框（最近使用 / 局域网扫描的结果都长这样）
   void _applyAddress(String display) {
-    var host = display.trim();
+    var host = _normalizeAddr(display);
     String? port;
-    final m = RegExp(r'^(.+):(\d+)$').firstMatch(host);
+    final m = _hostPortRe.firstMatch(host);
     if (m != null) {
       host = m.group(1)!;
       port = m.group(2)!;
@@ -117,6 +143,8 @@ class _LoginPageState extends State<LoginPage> {
     setState(() {
       _addr.text = host;
       if (port != null) _port.text = port;
+      final hint = AppState.tlsHintFromAddress(host);
+      if (hint != null) _useTls = hint;
       _showFnIdHint = _isBareFnId;
     });
   }
@@ -132,14 +160,28 @@ class _LoginPageState extends State<LoginPage> {
   /// 四个输入框全部必填，且**没有任何默认值/自动推断**（用户明确要求）：
   /// 地址、端口、账号、密码缺一不可，端口绝不由 App 自动补全。
   Future<void> _submit() async {
+    if (_submitting) return;
     final st = AppState.I;
     if (_addr.text.trim().isEmpty) {
       _snack('请填写 IP 地址或域名');
       return;
     }
-    if (_port.text.trim().isEmpty &&
-        !RegExp(r'^(.+):(\d+)$').hasMatch(_addr.text.trim())) {
-      _snack('请填写端口号：NAS 上 HTTP 与 HTTPS 的端口是分开配置的');
+    // 端口范围校验（此前只有「发现局域网内设备」那一处做了校验）
+    final portText = _port.text.trim();
+    if (portText.isNotEmpty) {
+      final p = int.tryParse(portText);
+      if (p == null || p < 1 || p > 65535) {
+        _snack('端口号必须是 1–65535 之间的数字');
+        return;
+      }
+    }
+    // 提交校验与同页的「连接目标预览」共用同一套解析规则。
+    // 以前这里自己用正则判断"地址里有没有端口"，粘贴带路径的 URL 时会出现
+    // 预览说能连、提交却说「请填写端口号」的自相矛盾。
+    if (AppState.resolveAddress(
+            address: _addr.text, port: _port.text, tls: _useTls) ==
+        null) {
+      _snack('请填写端口号（1–65535 的数字）：NAS 上 HTTP 与 HTTPS 的端口是分开配置的');
       return;
     }
     if (_user.text.trim().isEmpty) {
@@ -151,43 +193,44 @@ class _LoginPageState extends State<LoginPage> {
       return;
     }
 
-    var code = await AppPrefs.accessCode();
-    // 最多问三轮：第一轮没带码 → 要码；第二轮带错误码 → 提示重输
-    for (var round = 0; round < 3; round++) {
-      final ok = await st.connect(
-        address: _addr.text,
-        port: _port.text,
-        user: _user.text.trim(),
-        password: _pwd.text,
-        accessCode: code,
-        useTls: _useTls,
-        rememberPassword: _remember,
-        trustSelfSigned: _trustCert,
-      );
-      if (!mounted) return;
-      if (ok) {
-        final r = AppState.resolveAddress(
-            address: _addr.text, port: _port.text, tls: _useTls);
-        await AppPrefs.pushAddress(r?.display ?? _addr.text.trim());
-        return;
-      }
-
-      if (st.errorCode == kErrNeedAccessCode) {
-        final input = await _askAccessCode(
-          title: code.isEmpty ? '需要访问码' : '访问码不正确',
-          initial: code,
+    setState(() => _submitting = true);
+    try {
+      var code = await AppPrefs.accessCode();
+      // 最多问三轮：第一轮没带码 → 要码；第二轮带错误码 → 提示重输
+      for (var round = 0; round < 3; round++) {
+        final ok = await st.connect(
+          address: _addr.text,
+          port: _port.text,
+          user: _user.text.trim(),
+          password: _pwd.text,
+          accessCode: code,
+          useTls: _useTls,
+          rememberPassword: _remember,
+          trustSelfSigned: _trustCert,
         );
-        if (input == null) {
-          setState(() {});
+        if (!mounted) return;
+        if (ok) {
+          final r = AppState.resolveAddress(
+              address: _addr.text, port: _port.text, tls: _useTls);
+          await AppPrefs.pushAddress(r?.display ?? _addr.text.trim());
           return;
         }
-        code = input;
-        continue;
+
+        if (st.errorCode == kErrNeedAccessCode) {
+          final input = await _askAccessCode(
+            title: code.isEmpty ? '需要访问码' : '访问码不正确',
+            initial: code,
+          );
+          if (input == null) return;
+          code = input;
+          continue;
+        }
+        return;
       }
-      setState(() {});
-      return;
+    } finally {
+      // 失败信息由 AppState 持有，这里只要把按钮从 loading 态放回来
+      if (mounted) setState(() => _submitting = false);
     }
-    setState(() {});
   }
 
   Future<String?> _askAccessCode({
@@ -570,8 +613,8 @@ class _LoginPageState extends State<LoginPage> {
         SizedBox(
           height: 52,
           child: FilledButton(
-            onPressed: st.connecting ? null : _submit,
-            child: st.connecting
+            onPressed: (st.connecting || _submitting) ? null : _submit,
+            child: (st.connecting || _submitting)
                 ? const SizedBox(
                     width: 22,
                     height: 22,
@@ -744,7 +787,14 @@ class _LoginPageState extends State<LoginPage> {
 
   Widget _bottomLinks() => Padding(
         padding: const EdgeInsets.fromLTRB(20, 4, 20, 12),
-        child: Row(
+        // 用 Wrap 而不是 Row + Spacer：两段文案在系统字体放大到约 1.5 倍时
+        // 会超过屏幕宽度 —— Row 只会横向溢出（release 下右侧按钮被裁到屏外，
+        // 而这一行在滚动视图之外救不回来），Wrap 则会自然换到第二行。
+        child: Wrap(
+          alignment: WrapAlignment.spaceBetween,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 8,
+          runSpacing: 4,
           children: [
             TextButton(
               onPressed: _discover,
@@ -754,18 +804,6 @@ class _LoginPageState extends State<LoginPage> {
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),
               child: const Text('发现局域网内设备',
-                  style: TextStyle(fontSize: 13.5, color: FnosColors.textSub)),
-            ),
-            const Spacer(),
-            TextButton(
-              onPressed: () => Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const DownloadsPage())),
-              style: TextButton.styleFrom(
-                minimumSize: Size.zero,
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-              child: const Text('查看已下载数据',
                   style: TextStyle(fontSize: 13.5, color: FnosColors.textSub)),
             ),
           ],

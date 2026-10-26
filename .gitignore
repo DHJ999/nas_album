@@ -47,3 +47,12 @@ Thumbs.db
 # ---- 构建期注入的接口参数（绝不入库）----
 app/tool/secrets.json
 app/lib/core/secrets.g.dart
+# ---- Android 模块构建产物（2026-10-26 补：之前漏了，会混进 git status）----
+app/android/build/
+
+# ---- 本地临时调试脚本（不属于项目）----
+_tmp_*.sh
+
+# ---- 本地素材：README 的分版本草稿（仓库只保留 README.md）----
+README - 本地.md
+README - GitHub.md

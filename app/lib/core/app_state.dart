@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/models.dart';
+import 'error_text.dart';
 import 'fnos_client.dart';
 import 'prefs.dart';
 
@@ -36,7 +37,6 @@ class AppState extends ChangeNotifier {
   /// 内存中的登录密码（用于 token 失效后静默重登）。
   /// 未勾选「记住密码」时不会写盘，仅进程内有效。
   String _password = '';
-  bool _rememberPwd = false;
 
   /// 是否放行自签名证书（NAS 的 HTTPS 默认是自签证书）。
   /// 冷启动重建 client 时要沿用上次的选择，否则重登会撞证书错误。
@@ -52,30 +52,45 @@ class AppState extends ChangeNotifier {
     final sp = await SharedPreferences.getInstance();
     final raw = sp.getString(_kSession);
     final form = await AppPrefs.loadLoginForm();
-    _rememberPwd = form.rememberPassword;
     _trustCert = form.trustCert;
+    // 密码只认「登录表单」这一份（见 saveSession 的说明）：会话文件里不再存密码。
+    // 旧版本会把它同时写进 session，这里同样以表单为准，行为不变。
+    _password = form.password;
     if (raw == null) return;
     try {
       final s = FnosSession.fromJson(jsonDecode(raw) as Map<String, dynamic>);
-      // 未记住密码时，磁盘上的会话里没有 password，
-      // 但表单里可能还留着（用户只是没勾选记住密码）——以文件为准，不跨启动复用。
-      _password = s.password;
       session = s;
     } catch (_) {
       session = null;
     }
   }
 
-  Future<void> saveSession(FnosSession s, {bool withPassword = true}) async {
+  /// 只落盘会话凭据，**不再落盘密码**。
+  ///
+  /// 以前密码会同时写进这里和「登录表单」，同一个明文在盘上出现两次（也就
+  /// 多一个可能被系统自动备份带走的位置）。现在以 [AppPrefs.saveLoginForm]
+  /// 为唯一来源 —— 未勾选「记住密码」时那份写的就是空串。
+  Future<void> saveSession(FnosSession s) async {
     final sp = await SharedPreferences.getInstance();
-    final map = s.toJson();
-    if (!withPassword) map.remove('password');
-    await sp.setString(_kSession, jsonEncode(map));
+    await sp.setString(_kSession, jsonEncode(s.toJson()));
   }
 
   Future<void> logout() async {
     final sp = await SharedPreferences.getInstance();
     await sp.remove(_kSession);
+    // 隐私政策承诺「退出登录后清除保存的令牌与（若勾选过的）密码」。
+    // 以前只删了 session，盘上的明文密码与「记住密码」勾选会留着 ——
+    // 退出后登录页密码框仍是预填的。地址/账号/HTTPS 等保留，方便直接补输重登。
+    final f = await AppPrefs.loadLoginForm();
+    await AppPrefs.saveLoginForm(
+      host: f.host,
+      port: f.port,
+      user: f.user,
+      password: '',
+      useTls: f.useTls,
+      rememberPassword: false,
+      trustCert: f.trustCert,
+    );
     client?.close();
     client = null;
     session = null;
@@ -109,7 +124,12 @@ class AppState extends ChangeNotifier {
     required String port,
     required bool tls,
   }) {
-    var a = address.trim();
+    // 全角冒号统一成半角：中文输入法很容易打出「192.168.10.2：5000」。
+    // 以前只在「读回填值 / 应用扫描结果」那两条路径做了归一化，提交路径没做，
+    // 于是它会被当成 host 的一部分百分号编码进 URL
+    // （host 变成 192.168.10.2%EF%BC%9A5000），然后 DNS 解析失败 ——
+    // 用户只看到一个和输入毫无关联的"网络错误"。
+    var a = address.replaceAll('：', ':').trim();
     a = a.replaceFirst(RegExp(r'^[a-zA-Z]+://'), '');
     a = a.replaceAll(RegExp(r'/+$'), '');
     // 去掉可能残留的路径
@@ -117,7 +137,10 @@ class AppState extends ChangeNotifier {
     if (slash >= 0) a = a.substring(0, slash);
 
     String? inlinePort;
-    final m = RegExp(r'^(.+):(\d+)$').firstMatch(a);
+    // `[^:]+` 而不是 `.+`：裸 IPv6（fe80::1）会被贪婪匹配拆成 host="fe80:"、
+    // port="1"，等于把用户输入静默改写。带方括号的 IPv6（[fe80::1]:8080）
+    // 照常拆出端口。
+    final m = RegExp(r'^(\[[^\]]+\]|[^:]+):(\d+)$').firstMatch(a);
     if (m != null) {
       a = m.group(1)!;
       inlinePort = m.group(2);
@@ -139,8 +162,25 @@ class AppState extends ChangeNotifier {
       // 端口为空一律返回 null，由调用方提示用户补输。
     }
     if (p.isEmpty) return null;
+    // 端口范围校验：以前只校验了「端口输入框」，地址里内联写的端口（`:0`、
+    // `:99999`）会一路穿到网络层 —— Uri 并不拒绝越界端口，只是连接失败，
+    // 于是用户看到的是一个跟端口无关的笼统错误。
+    final portNum = int.tryParse(p);
+    if (portNum == null || portNum < 1 || portNum > 65535) return null;
 
-    return (host: '$a:$p', tls: useTls, display: '$a:$p');
+    return (host: '$a:$portNum', tls: useTls, display: '$a:$portNum');
+  }
+
+  /// 从用户输入的地址里读出**显式写下的** scheme。
+  ///
+  /// 返回 `null` 表示地址里没写 scheme（此时沿用界面上的 HTTPS 开关）。
+  /// 登录页用它把「地址写了 https:// 但开关没打开」这种自相矛盾的状态自动对齐，
+  /// 避免预览显示 https 而实际按明文去连 TLS 端口。
+  static bool? tlsHintFromAddress(String address) {
+    final a = address.trim().toLowerCase();
+    if (a.startsWith('https://')) return true;
+    if (a.startsWith('http://')) return false;
+    return null;
   }
 
   // ───────────── 登录 ─────────────
@@ -166,7 +206,7 @@ class AppState extends ChangeNotifier {
       final r = resolveAddress(address: address, port: port, tls: useTls);
       if (r == null) {
         throw const FnosException(
-            -2, '请填写端口号：同一台 NAS 上 HTTP 与 HTTPS 的端口是分别配置的，请按 NAS 里的实际端口填写。');
+            -2, '请填写端口号（1–65535 的数字）：同一台 NAS 上 HTTP 与 HTTPS 的端口是分别配置的，请按 NAS 里的实际端口填写。');
       }
       final c = FnosClient(
         host: r.host,
@@ -180,9 +220,8 @@ class AppState extends ChangeNotifier {
       client = c;
       session = s;
       _password = password;
-      _rememberPwd = rememberPassword;
       _trustCert = trustSelfSigned;
-      await saveSession(s, withPassword: rememberPassword);
+      await saveSession(s);
       await AppPrefs.saveLoginForm(
         host: address,
         port: port,
@@ -201,7 +240,7 @@ class AppState extends ChangeNotifier {
       error = e.message;
       errorCode = e.code;
     } catch (e) {
-      error = '连接失败：$e';
+      error = friendlyError(e);
     }
     connecting = false;
     notifyListeners();
@@ -248,9 +287,20 @@ class AppState extends ChangeNotifier {
     try {
       final ns = await c.login(user: s.userName, password: _password);
       session = ns;
-      await saveSession(ns, withPassword: _rememberPwd);
+      await saveSession(ns);
       notifyListeners();
       return true;
+    } on FnosException catch (e) {
+      // 只有「账号或密码错误」(131072) 才是凭据本身失效、重登永远不会成功，
+      // 这时才清会话回登录页（避免停在持续 401 的空壳首页）。
+      //
+      // ⚠️ 131089（IP 被封）与 135168（需要两步验证）**不 logout**：
+      //  · IP 封禁是临时的，解封后还能自动续期；
+      //  · 两步验证是本应用不支持、但账号密码仍然有效的场景。
+      // 而 logout() 会顺带清掉「记住的密码」，为这两种临时/边缘状态付这个
+      // 代价太大 —— 让 401 冒到页面上，用户可自行决定是否重登。
+      if (e.code == 131072) await logout();
+      return false;
     } catch (_) {
       return false;
     }

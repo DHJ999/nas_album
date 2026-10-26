@@ -3,7 +3,20 @@ library;
 
 int? _i(dynamic v) => v is int ? v : (v is num ? v.toInt() : int.tryParse('$v'));
 String _s(dynamic v) => v == null ? '' : '$v';
-bool _b(dynamic v) => v == true || v == 1 || v == '1' || v == 'true';
+
+/// 容错布尔解析。
+///
+/// 除了 `true` / `1` / `"1"` / `"true"`，还要认大小写变体与常见的
+/// `yes` / `y` / `on` —— 设备端各接口对同一语义字段的取值风格并不统一，
+/// 少认一种就会把「已开启」读成「未开启」。
+bool _b(dynamic v) {
+  if (v == true || v == 1) return true;
+  if (v is String) {
+    final s = v.trim().toLowerCase();
+    return s == '1' || s == 'true' || s == 'yes' || s == 'y' || s == 'on';
+  }
+  return false;
+}
 
 /// 解析 fnOS 的日期字符串 `YYYY:MM:DD HH:MM:SS`
 DateTime? parseFnosDate(String? s) {
@@ -50,6 +63,25 @@ class ThumbUrls {
   /// 会被误判为空，占位图 / 降级逻辑走错分支。
   bool get isEmpty =>
       xxs.isEmpty && xs.isEmpty && s.isEmpty && m.isEmpty && original.isEmpty;
+
+  /// **观看用的中等清晰度**（默认档位）。
+  ///
+  /// 服务端下发的档位是 `/p/api/v1/stream/p/t/{id}/{level}/{uuid}`，
+  /// `level` ∈ `xxs / xs / s / m / o`。实测同一张 1080×2400 的照片：
+  ///   xxs 2.1KB(60×133) / xs 12KB(180×400) / s 22.6KB(240×533)
+  ///   / **m 382KB(1080 级)** / o 1.5MB(原图)
+  ///
+  /// 为什么默认取 `m` 而不是 `s`：`s` 长边只有 533px，在 6.7" 屏上全屏显示
+  /// 明显发糊（用户实机反馈「看一张图片的时候太糊了」）；`m` 是 1080 级，
+  /// 约为原图「一半清晰度」的观感，体积只有原图的 1/4。
+  /// 逐级降级，保证任何条目都有可用地址。
+  String get viewHalf {
+    if (m.isNotEmpty) return m;
+    if (s.isNotEmpty) return s;
+    if (xs.isNotEmpty) return xs;
+    if (xxs.isNotEmpty) return xxs;
+    return original;
+  }
 }
 
 /// 一张照片 / 一段视频
@@ -246,6 +278,62 @@ class PersonItem {
         isHide: _i(j['isHide']) ?? 0, updatedAt: _i(j['updatedAt']) ?? 0,
       );
   String get displayName => name.isEmpty ? '未命名' : name;
+}
+
+/// 媒体类型（`media_category/list`）
+///
+/// 实测条目：`{"id":8729,"category":1,"uuid":"...","count":3448}`
+/// `category` 取值：1 = 照片、3 = 视频（其余取值本机未实测）。
+class MediaCategory {
+  final int id;
+  final int category;
+  final String uuid;
+  final int count;
+
+  const MediaCategory({
+    required this.id,
+    required this.category,
+    required this.uuid,
+    required this.count,
+  });
+
+  factory MediaCategory.fromJson(Map<String, dynamic> j) => MediaCategory(
+        id: _i(j['id']) ?? 0,
+        category: _i(j['category']) ?? 0,
+        uuid: _s(j['uuid']),
+        count: _i(j['count']) ?? 0,
+      );
+
+  /// 是否视频类型
+  bool get isVideo => category == 3;
+
+  /// 是否图片类型
+  bool get isPhoto => category == 1;
+}
+
+/// 客户端侧的媒体类型过滤。
+///
+/// ⚠️ 为什么必须客户端过滤：`gallery/getList?category=` **实测无效**
+/// （服务端忽略该参数、恒返回全量 —— 见 API 逆向报告 C.3）。
+/// 所以拉全量后在本地按条目的 [PhotoItem.category] 筛。
+enum MediaFilter {
+  /// 照片（category == 'photo'）
+  photo,
+
+  /// 视频（category == 'video'）
+  video;
+
+  /// 按本枚举过滤条目。
+  List<PhotoItem> apply(List<PhotoItem> list) {
+    switch (this) {
+      case MediaFilter.photo:
+        return list.where((e) => !e.isVideo).toList();
+      case MediaFilter.video:
+        return list.where((e) => e.isVideo).toList();
+    }
+  }
+
+  String get label => this == MediaFilter.photo ? '图片' : '视频';
 }
 
 /// 相册文件夹

@@ -23,6 +23,33 @@ class FnosException implements Exception {
   String toString() => 'FnosException($code): $message';
 }
 
+/// 把可能自带 query 的地址拆成 `(path, params)`。
+///
+/// 设备下发的部分 URL（缩略图 / 封面等）会带 query。签名基准必须与**实际发出
+/// 的 query** 完全一致：如果直接把 `"/x/y?w=100"` 当 path 去算 `a` 分量，
+/// 而实际请求的 query 是 `w=100`，两者口径不同 → 服务端校验失败 401。
+/// 因此统一在这里拆开，让「签名」与「请求」共用同一份参数。
+///
+/// 已显式传入的 [params] 优先（调用方意图更明确）。
+({String path, Map<String, dynamic>? params}) splitPathQuery(
+    String path, Map<String, dynamic>? params) {
+  final q = path.indexOf('?');
+  if (q < 0) return (path: path, params: params);
+  final merged = <String, dynamic>{};
+  final raw = path.substring(q + 1);
+  if (raw.isNotEmpty) {
+    try {
+      merged.addAll(Uri.splitQueryString(raw));
+    } catch (_) {
+      // query 不是合法 k=v 形式：不拆，按原样交给调用方（宁可签名口径怪，
+      // 也不要因为解析失败直接把参数丢掉）
+      return (path: path, params: params);
+    }
+  }
+  if (params != null) merged.addAll(params);
+  return (path: path.substring(0, q), params: merged);
+}
+
 /// 本地约定的错误码：NAS 开了「访问码门禁」但客户端还没拿到访问码。
 /// 登录页据此弹出访问码输入框（而不是当成普通登录失败）。
 const int kErrNeedAccessCode = 60201;
@@ -65,7 +92,8 @@ class FnosSession {
         'machineId': machineId, 'uid': uid, 'admin': admin,
         'host': host, 'useTls': useTls, 'accessCode': accessCode,
         'userName': userName,
-        if (password.isNotEmpty) 'password': password,
+        // 刻意不写 password：本机的密码只由「登录表单」那一份负责保存，
+        // 同一个明文不再重复落盘。[fromJson] 仍读旧数据以兼容历史安装。
       };
 
   factory FnosSession.fromJson(Map<String, dynamic> j) => FnosSession(
@@ -223,6 +251,11 @@ class FnosClient {
     WebSocket ws;
     try {
       ws = await _openWebSocket(uri).timeout(const Duration(seconds: 20));
+    } on TimeoutException {
+      // 不翻译的话会一路冒到界面，用户看到的是
+      // "连接失败：TimeoutException after 0:00:20.000000: Future not completed"
+      throw FnosException(-1,
+          '连接 $host 超时：请确认端口填的是 NAS 网关端口，且地址与当前的 HTTP/HTTPS 开关匹配。');
     } on SocketException catch (e) {
       throw FnosException(-1, '无法连接 $host：${e.message}');
     } on HandshakeException catch (e) {
@@ -271,7 +304,12 @@ class FnosClient {
     }));
 
     try {
-      final r = await completer.future.timeout(const Duration(seconds: 25));
+      Map<String, dynamic> r;
+      try {
+        r = await completer.future.timeout(const Duration(seconds: 25));
+      } on TimeoutException {
+        throw const FnosException(-1, '登录请求超时：NAS 没有响应，请检查网络后重试。');
+      }
       final result = r['result'];
       if (result != 'succ') {
         final errno = r['errno'];
@@ -367,15 +405,20 @@ class FnosClient {
     bool raw = false,
     bool retried = false,
   }) async {
-    final uri = Uri.parse('$baseUrl$path').replace(
-      queryParameters: params?.map((k, v) => MapEntry(k, '$v')),
+    // 见 [splitPathQuery]：签名基准与实际请求必须共用同一份 query。
+    final split = splitPathQuery(path, params);
+    final realPath = split.path;
+    final realParams = split.params;
+
+    final uri = Uri.parse('$baseUrl$realPath').replace(
+      queryParameters: realParams?.map((k, v) => MapEntry(k, '$v')),
     );
     final req = await _http.openUrl(method, uri);
     req.headers.set('x-access-source', 'app');
     req.headers.set('Accept', raw ? '*/*' : 'application/json');
     req.headers.set('User-Agent', 'okhttp/4.12.0');
     req.headers.set('authx',
-        buildAuthx(method: method, path: path, params: params,
+        buildAuthx(method: method, path: realPath, params: realParams,
             body: body, apiKey: apiKey));
     if (_cookieHeader.isNotEmpty) req.headers.set('Cookie', _cookieHeader);
     if (body != null) {
@@ -391,8 +434,13 @@ class FnosClient {
     if (raw) {
       if (resp.statusCode == 401 && !retried) {
         await resp.drain<void>();
-        return _request(method, path,
-            params: params, body: body, raw: raw, retried: true);
+        // 必须先静默重登换掉过期 token 再重试。以前这一步没有调 relogin，
+        // 等于用同一个旧 token 再打一次，最后把 401 的响应体当图片字节返回。
+        if (relogin != null && await relogin!()) {
+          return _request(method, path,
+              params: params, body: body, raw: raw, retried: true);
+        }
+        throw const FnosException(401, '鉴权已失效，请重新登录');
       }
       final bytes = <int>[];
       await for (final chunk in resp) {
@@ -597,6 +645,24 @@ class FnosClient {
         .toList();
   }
 
+  /// 媒体类型聚合（`media_category/list`）。
+  ///
+  /// 实测返回：`{"list":[{"id":8729,"category":1,"uuid":"...","count":3448}, ...]}`
+  /// —— 这是「全部 / 视频 / 图片 / …」这类**媒体类型**，不是相册。
+  /// `category` 字段的取值：1 = 照片、3 = 视频（其余取值本机未实测）。
+  ///
+  /// ⚠️ 想按类型过滤照片列表**不能**靠 `gallery/getList?category=` ——
+  /// 实测服务端会忽略该参数、仍返回全量（见 API 逆向报告 C.3）。
+  /// 正确做法：本方法只用来取「类型 + 条数」，真正的列表由
+  /// [MediaFilter] 在客户端按 [PhotoItem.category] 过滤。
+  Future<List<MediaCategory>> mediaCategories() async {
+    final data = await _request('GET', '/p/api/v1/media_category/list');
+    final list = (data is Map ? data['list'] : null) as List? ?? const [];
+    return list
+        .map((e) => MediaCategory.fromJson(Map<String, dynamic>.from(e as Map)))
+        .toList();
+  }
+
   /// 原图下载地址（需带鉴权头，配合 [fetchBytes] 使用）
   String originalPath(int photoId) => '/p/api/v1/download/original/$photoId';
 
@@ -608,12 +674,21 @@ class FnosClient {
 
   /// 地点聚类（设备扫描的 GPS 城市聚合，实测：菏泽/南宁/呼伦贝尔…）
   /// 实测条目：{country, city, itemCount, posterUrl}
+  ///
+  /// 无参数时服务端默认只返回 8 条，因此必须显式分页直到拿全。
   Future<List<GeoCluster>> exploreGeos() async {
-    final data = await _request('GET', '/p/api/v1/explore/geos');
-    final list = (data is Map ? data['list'] : null) as List? ?? const [];
-    return list
-        .map((e) => GeoCluster.fromJson(Map<String, dynamic>.from(e as Map)))
-        .toList();
+    const pageSize = 100;
+    final all = <GeoCluster>[];
+    for (int offset = 0;; offset += pageSize) {
+      final data = await _request('GET', '/p/api/v1/explore/geos',
+          params: {'limit': '$pageSize', 'offset': '$offset'});
+      final list = (data is Map ? data['list'] : null) as List? ?? const [];
+      if (list.isEmpty) break;
+      all.addAll(list.map((e) =>
+          GeoCluster.fromJson(Map<String, dynamic>.from(e as Map))));
+      if (list.length < pageSize) break;
+    }
+    return all;
   }
 
   /// 场景标签（事物场景，如 天空云彩/公园/草地；未扫描时为空列表）

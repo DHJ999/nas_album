@@ -1,13 +1,17 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 
 import '../core/app_state.dart';
+import '../core/error_text.dart';
 import '../core/media_deleter.dart';
 import '../core/media_downloader.dart';
+import '../core/media_preloader.dart';
 import '../core/prefs.dart';
 import '../core/theme.dart';
 import '../models/models.dart';
 import '../widgets/delete_confirm.dart';
 import '../widgets/fnos_image.dart';
+import '../widgets/square_thumb_tile.dart';
 import 'viewer_page.dart';
 
 /// 图库：两种显示样式
@@ -33,6 +37,9 @@ class _TimelinePageState extends State<TimelinePage>
   int _offset = 0;
   GalleryViewMode _mode = GalleryViewMode.timeline;
   static const _pageSize = 120;
+
+  /// 加载代际：下拉刷新会自增，用于作废在飞的分页请求。
+  int _gen = 0;
 
   /// 多选模式开关；[_selected] 存的是 PhotoItem.id
   bool _selectMode = false;
@@ -74,14 +81,23 @@ class _TimelinePageState extends State<TimelinePage>
   }
 
   Future<void> _refresh() async {
-    if (_loading) return;
+    // 以前这里是 `if (_loading) return;` —— 后台恰有分页请求在飞时，下拉刷新
+    // 会被整个吞掉（连列表都不清），用户看到的是"下拉了没反应"。
+    // 现在改为：作废在飞请求（_gen），立刻按 offset=0 重新加载。
+    _gen++;
     setState(() {
       _error = null;
       _offset = 0;
       _hasMore = true;
       _photos.clear();
+      // 列表被换掉了，多选状态必须一起清，否则「已选 N 项」与网格里的勾对不上
+      _selected.clear();
+      _selectMode = false;
+      // 在飞请求的结果马上会被丢弃，这里直接放开，让下面的 _loadMore 接手
+      _loading = false;
     });
-    clearImageCache();
+    _invalidateGrouped();
+    MediaPreloader.I.resetAll();
     await _loadMore();
   }
 
@@ -90,16 +106,20 @@ class _TimelinePageState extends State<TimelinePage>
     if (_loading || !_hasMore) return;
     final c = AppState.I.client;
     if (c == null) {
+      if (!mounted) return;
       setState(() {
         _loading = false;
         _error = '尚未连接到 NAS，请重新登录';
       });
       return;
     }
+    final gen = _gen;
     try {
       if (mounted) setState(() => _loading = true);
       final r = await c.getPhotos(limit: _pageSize, offset: _offset);
-      if (!mounted) return;
+      // 请求期间发生过下拉刷新：本次结果已作废，直接丢弃。
+      // _loading 归新请求所有，这里不能碰。
+      if (!mounted || gen != _gen) return;
       setState(() {
         _photos.addAll(r.list);
         _offset += r.list.length;
@@ -107,13 +127,27 @@ class _TimelinePageState extends State<TimelinePage>
         _loading = false;
         _error = null;
       });
+      _invalidateGrouped();
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _gen) return;
+      // 不再保留 _hasMore=true：否则弱网下每 300ms 就会拿同一个 offset
+      // 重试一次必然失败的请求。改为停住，由页脚的「点按重试」显式再来。
       setState(() {
         _loading = false;
-        _error = '$e';
+        _error = friendlyError(e);
+        _hasMore = false;
       });
     }
+  }
+
+  /// 页脚「加载失败，点按重试」入口。
+  void _retryLoad() {
+    if (_loading) return;
+    setState(() {
+      _hasMore = true;
+      _error = null;
+    });
+    _loadMore();
   }
 
   Future<void> _pickMode() async {
@@ -167,9 +201,24 @@ class _TimelinePageState extends State<TimelinePage>
     await AppPrefs.setGalleryViewMode(picked);
   }
 
+  /// 分组结果缓存。
+  ///
+  /// 以前 [_grouped] 是个 getter，每次 build 都要对全部 _photos 重做一次分组，
+  /// 而且每项都会跑一次 parseFnosDate（正则）。上千张照片后，每次滚动触底、
+  /// 每次多选勾选都会 O(n) 重算，明显掉帧。这里改为缓存 + 显式失效。
+  List<MapEntry<String, List<int>>>? _groupedCache;
+
+  void _invalidateGrouped() => _groupedCache = null;
+
   /// 把照片按天分组（保持接口返回的倒序）。
   /// 分组里存的是 [_photos] 的全局下标，避免渲染时做 O(n) 查找。
-  List<MapEntry<String, List<int>>> get _grouped {
+  ///
+  /// ⚠️ 下标与位置绑定：任何增删 _photos 的地方都必须先调 [_invalidateGrouped]，
+  /// 否则缓存会指到错误的照片上。
+  List<MapEntry<String, List<int>>> get _grouped =>
+      _groupedCache ??= _buildGrouped();
+
+  List<MapEntry<String, List<int>>> _buildGrouped() {
     final map = <String, List<int>>{};
     final order = <String>[];
     for (var i = 0; i < _photos.length; i++) {
@@ -182,6 +231,107 @@ class _TimelinePageState extends State<TimelinePage>
       list.add(i);
     }
     return order.map((k) => MapEntry(k, map[k]!)).toList();
+  }
+
+  /// 从大图页返回时的回调：那边可能删掉了条目（直接改的就是本页的 _photos）。
+  ///
+  /// 必须 (1) 重算分组，因为下标全部前移；(2) 把分页偏移收敛到当前长度 ——
+  /// 服务端列表已经少了一条，沿用旧 offset 会正好跳掉一张照片。
+  void _onViewerChanged() {
+    _invalidateGrouped();
+    if (!mounted) return;
+    setState(() => _offset = _photos.length);
+  }
+
+  // ─────────────────── 从大图页返回后定位 ───────────────────
+
+  /// 大图页里翻到的最后一张。只做记录、**不 setState** ——
+  /// 大图页盖在上面时重建整个照片墙纯属浪费（快速连翻会明显掉帧）。
+  int? _lastSeenIndex;
+
+  /// 正在被定位的那一张：临时给它挂上 [_revealKey]，便于下一帧量真实位置
+  int? _revealTarget;
+  final GlobalKey _revealKey = GlobalKey();
+
+  Future<void> _openViewer(int index) async {
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => ViewerPage(
+        items: _photos,
+        initialIndex: index,
+        onChanged: _onViewerChanged,
+        onIndexChanged: (i) => _lastSeenIndex = i,
+      ),
+    ));
+    if (!mounted) return;
+    final target = _lastSeenIndex;
+    _lastSeenIndex = null;
+    // 只是打开又退出（没翻过页）就什么都不做，避免照片墙莫名跳动
+    if (target == null || target == index) return;
+    await _revealIndex(target);
+  }
+
+  /// 把照片墙滚到第 [index] 张。
+  ///
+  /// 两步：先用布局常量估算偏移跳过去，再在下一帧用 Flutter 自己的
+  /// `getOffsetToReveal` 做一次精确校正 —— 估算受字体行高 / 内边距影响，
+  /// 差几十像素很正常，纯估算会让目标偏出视口。
+  Future<void> _revealIndex(int index) async {
+    if (!mounted || !_scroll.hasClients) return;
+    if (index < 0 || index >= _photos.length) return;
+
+    setState(() => _revealTarget = index);
+    _scroll.jumpTo(_estimateOffsetFor(index)
+        .clamp(0.0, _scroll.position.maxScrollExtent));
+
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || !_scroll.hasClients) return;
+    final box = _revealKey.currentContext?.findRenderObject();
+    if (box is RenderBox && box.attached) {
+      final viewport = RenderAbstractViewport.maybeOf(box);
+      if (viewport != null) {
+        final exact = viewport
+            .getOffsetToReveal(box, 0.05)
+            .offset
+            .clamp(0.0, _scroll.position.maxScrollExtent);
+        if ((exact - _scroll.offset).abs() > 0.5) _scroll.jumpTo(exact);
+      }
+    }
+    if (mounted) setState(() => _revealTarget = null);
+  }
+
+  /// 日期标题那一行的真实高度：用 TextPainter 量，别猜字号行高
+  double _dayHeaderHeight() {
+    final tp = TextPainter(
+      text: const TextSpan(
+          text: '0',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+      textDirection: TextDirection.ltr,
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout();
+    return tp.height + 16 + 8; // Padding(16, 16, 16, 8)
+  }
+
+  /// 用布局常量估算第 [index] 张缩略图所在的滚动偏移。
+  double _estimateOffsetFor(int index) {
+    final width = MediaQuery.of(context).size.width;
+    if (_mode == GalleryViewMode.fill) {
+      // 铺满样式：3 列、零间距、无分组
+      final side = width / 3;
+      return (index ~/ 3) * side;
+    }
+    // 时间轴样式：SliverPadding(horizontal: 2) + 3 列 + 主/次轴间距 2
+    final side = (width - 4 - 2 * 2) / 3;
+    final rowH = side + 2;
+    final headerH = _dayHeaderHeight();
+    var offset = 0.0;
+    for (final g in _grouped) {
+      final rows = (g.value.length + 2) ~/ 3;
+      if (index >= g.value.first && index <= g.value.last) {
+        return offset + headerH + ((index - g.value.first) ~/ 3) * rowH;
+      }
+      offset += headerH + rows * side + (rows - 1) * 2;
+    }
+    return offset;
   }
 
   void _snack(String s) {
@@ -253,10 +403,11 @@ class _TimelinePageState extends State<TimelinePage>
         _selected.clear();
         _selectMode = false;
       });
-      clearImageCache();
+      _invalidateGrouped();
+      MediaPreloader.I.resetAll();
       if (_photos.isEmpty) _refresh();
     } catch (e) {
-      _snack('删除失败：$e');
+      _snack('删除失败：${friendlyError(e)}');
     }
   }
 
@@ -439,23 +590,16 @@ class _TimelinePageState extends State<TimelinePage>
   List<Widget> get _fillSlivers => [
         if (_photos.isNotEmpty)
           SliverGrid(
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 3,
-              mainAxisSpacing: 0,
-              crossAxisSpacing: 0,
-            ),
+            gridDelegate: AdaptiveCategoryGrid(context),
             delegate: SliverChildBuilderDelegate(
               (context, i) => _Thumb(
+                key: i == _revealTarget ? _revealKey : null,
                 item: _photos[i],
-                all: _photos,
-                index: i,
                 selectMode: _selectMode,
                 selected: _selected.contains(_photos[i].id),
-                onChanged: () {
-                  if (mounted) setState(() {});
-                },
                 onLongPress: () => _enterSelect(_photos[i].id),
                 onToggle: () => _toggle(_photos[i].id),
+                onOpen: () => _openViewer(i),
               ),
               childCount: _photos.length,
             ),
@@ -526,25 +670,18 @@ class _TimelinePageState extends State<TimelinePage>
         SliverPadding(
           padding: const EdgeInsets.symmetric(horizontal: 2),
           sliver: SliverGrid(
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 3,
-              mainAxisSpacing: 2,
-              crossAxisSpacing: 2,
-            ),
+            gridDelegate: AdaptiveCategoryGrid(context),
             delegate: SliverChildBuilderDelegate(
               (context, i) {
                 final gi = g.value[i];
                 return _Thumb(
+                  key: gi == _revealTarget ? _revealKey : null,
                   item: _photos[gi],
-                  all: _photos,
-                  index: gi,
                   selectMode: _selectMode,
                   selected: _selected.contains(_photos[gi].id),
-                  onChanged: () {
-                    if (mounted) setState(() {});
-                  },
                   onLongPress: () => _enterSelect(_photos[gi].id),
                   onToggle: () => _toggle(_photos[gi].id),
+                  onOpen: () => _openViewer(gi),
                 );
               },
               childCount: g.value.length,
@@ -564,9 +701,24 @@ class _TimelinePageState extends State<TimelinePage>
                 ? const SizedBox(
                     width: 22, height: 22,
                     child: CircularProgressIndicator(strokeWidth: 2.4))
-                : Text(_hasMore ? '上拉加载更多' : '已经到底了',
-                    style: TextStyle(
-                        color: Theme.of(context).colorScheme.outline)),
+                // 分页失败时给出可点按的重试入口。以前失败只写 _error，而错误
+                // 界面只在"列表为空"时渲染，于是翻页失败对用户完全不可见，
+                // 页脚还一直显示「上拉加载更多」。
+                : _error != null && _photos.isNotEmpty
+                    ? GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: _retryLoad,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 16, vertical: 4),
+                          child: Text('加载失败，点按重试',
+                              style: TextStyle(
+                                  color: Theme.of(context).colorScheme.error)),
+                        ),
+                      )
+                    : Text(_hasMore ? '上拉加载更多' : '已经到底了',
+                        style: TextStyle(
+                            color: Theme.of(context).colorScheme.outline)),
           ),
         ),
       );
@@ -597,9 +749,6 @@ class _DownloadProgress extends StatelessWidget {
 
 class _Thumb extends StatelessWidget {
   final PhotoItem item;
-  final List<PhotoItem> all;
-  final int index;
-  final VoidCallback onChanged;
 
   /// 是否处于多选模式
   final bool selectMode;
@@ -613,15 +762,17 @@ class _Thumb extends StatelessWidget {
   /// 多选模式下点击切换选中
   final VoidCallback onToggle;
 
+  /// 非多选模式下点击：打开大图页（由父级负责导航，便于回传"最后看到第几张"）
+  final VoidCallback onOpen;
+
   const _Thumb({
+    super.key,
     required this.item,
-    required this.all,
-    required this.index,
-    required this.onChanged,
     required this.selectMode,
     required this.selected,
     required this.onLongPress,
     required this.onToggle,
+    required this.onOpen,
   });
 
   @override
@@ -631,12 +782,7 @@ class _Thumb extends StatelessWidget {
         : (item.thumb.xs.isNotEmpty ? item.thumb.xs : item.thumb.m);
     return GestureDetector(
       // 多选模式下点击只切换勾选；非多选时长按进入多选、点击进大图
-      onTap: selectMode
-          ? onToggle
-          : () => Navigator.of(context).push(MaterialPageRoute(
-                builder: (_) =>
-                    ViewerPage(items: all, initialIndex: index, onChanged: onChanged),
-              )),
+      onTap: selectMode ? onToggle : onOpen,
       onLongPress: selectMode ? null : onLongPress,
       child: Stack(
         fit: StackFit.expand,
