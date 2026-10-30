@@ -86,3 +86,7 @@ The source is built with Flutter. Environment requirements and build steps are d
 > This license permits personal, noncommercial use, modification, and sharing.
 > **Any commercial use requires prior written permission.**
 > It grants no trademark rights and comes with no warranty.
+
+---
+
+The official fnOS Photos standalone App is out, and I'm no longer maintaining this project.
