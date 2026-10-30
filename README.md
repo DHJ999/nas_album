@@ -1,14 +1,9 @@
 # NAS相册
 
 <p align="center">
-  <a href="https://github.com/DHJ999/nas_album/releases/latest"><img src="https://img.shields.io/github/v/release/DHJ999/nas_album?style=flat-square&amp;label=release&amp;color=2ea44f" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20NC-blue?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/platform-Android%207.0%2B-3DDC84?style=flat-square&amp;logo=android&amp;logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/Flutter-3.44.9-02569B?style=flat-square&amp;logo=flutter&amp;logoColor=white" alt="Flutter">
-  <br>
-  <img src="https://img.shields.io/github/downloads/DHJ999/nas_album/total?style=flat-square&amp;label=downloads&amp;color=orange" alt="Downloads">
-  <img src="https://img.shields.io/github/stars/DHJ999/nas_album?style=flat-square&amp;label=stars&amp;color=yellow" alt="Stars">
-  <img src="https://img.shields.io/github/last-commit/DHJ999/nas_album?style=flat-square&amp;label=last%20commit" alt="Last commit">
   <img src="https://img.shields.io/badge/data-stays%20local-success?style=flat-square" alt="Data stays local">
 </p>
 
