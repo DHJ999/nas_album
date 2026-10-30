@@ -89,4 +89,4 @@ The source is built with Flutter. Environment requirements and build steps are d
 
 ---
 
-The official fnOS Photos standalone App is out, and I'm no longer maintaining this project.
+With the official standalone app available, this project is no longer updated. Thanks for using it.
